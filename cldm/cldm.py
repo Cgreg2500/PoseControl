@@ -3,7 +3,7 @@ import torch
 import torch as th
 import torch.nn as nn
 
-from ldm.modules.diffusionmodules.util import (
+from ControlNet.ldm.modules.diffusionmodules.util import (
     conv_nd,
     linear,
     zero_module,
@@ -12,15 +12,15 @@ from ldm.modules.diffusionmodules.util import (
 
 from einops import rearrange, repeat
 from torchvision.utils import make_grid
-from ldm.modules.attention import SpatialTransformer
-from ldm.modules.diffusionmodules.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
-from ldm.models.diffusion.ddpm import LatentDiffusion
-from ldm.util import log_txt_as_img, exists, instantiate_from_config
-from ldm.models.diffusion.ddim import DDIMSampler
+from ControlNet.ldm.modules.attention import SpatialTransformer
+from ControlNet.ldm.modules.diffusionmodules.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
+from ControlNet.ldm.models.diffusion.ddpm import LatentDiffusion
+from ControlNet.ldm.util import log_txt_as_img, exists, instantiate_from_config
+from ControlNet.ldm.models.diffusion.ddim import DDIMSampler
 
 
 class ControlledUnetModel(UNetModel):
-    def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, **kwargs):
+    def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, return_resids=False, **kwargs):
         hs = []
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
@@ -31,18 +31,26 @@ class ControlledUnetModel(UNetModel):
                 hs.append(h)
             h = self.middle_block(h, emb, context)
 
-        if control is not None:
-            h += control.pop()
 
-        for i, module in enumerate(self.output_blocks):
-            if only_mid_control or control is None:
-                h = torch.cat([h, hs.pop()], dim=1)
-            else:
-                h = torch.cat([h, hs.pop() + control.pop()], dim=1)
-            h = module(h, emb, context)
+        if not return_resids:
+            if control is not None:
+                h += control.pop()
 
-        h = h.type(x.dtype)
-        return self.out(h)
+            for i, module in enumerate(self.output_blocks):
+                if only_mid_control or control is None:
+                    h = torch.cat([h, hs.pop()], dim=1)
+                else:
+                    h = torch.cat([h, hs.pop() + control.pop()], dim=1)
+                h = module(h, emb, context)
+
+            h = h.type(x.dtype)
+            return self.out(h)
+        else:
+            mid_additional_residual = (h + control.pop()).clone()
+
+            down_block_additional_residuals = reversed([hs.pop() + control.pop() for _ in self.output_blocks])
+
+            return mid_additional_residual, down_block_additional_residuals
 
 
 class ControlNet(nn.Module):
@@ -336,9 +344,10 @@ class ControlLDM(LatentDiffusion):
         else:
             control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
             control = [c * scale for c, scale in zip(control, self.control_scales)]
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
+            #mid_block_additional, down_block_additionals = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, return_resids=True)
 
-        return eps
+        control_range = len(control)-1
+        return control.pop(), reversed([control.pop() for i in range(control_range)]) 
 
     @torch.no_grad()
     def get_unconditional_conditioning(self, N):
